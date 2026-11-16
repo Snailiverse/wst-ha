@@ -1,0 +1,90 @@
+name: HA Release Watch
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get latest Home Assistant core release
+        id: ha
+        run: |
+          VERSION=$(curl -sL -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/home-assistant/core/releases/latest \
+            | jq -r '.tag_name')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Could not determine latest HA release" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Get HA version this integration currently declares support for
+        id: declared
+        run: |
+          DECLARED=$(jq -r '.homeassistant // "onbekend"' hacs.json)
+          echo "version=$DECLARED" >> "$GITHUB_OUTPUT"
+
+      - name: Check if an audit issue already exists for this version
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COUNT=$(gh issue list --repo "${{ github.repository }}" \
+            --label ha-release-check --state all \
+            --search "${{ steps.ha.outputs.version }} in:title" \
+            --json number --jq 'length')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure label exists
+        if: steps.existing.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create ha-release-check \
+            --repo "${{ github.repository }}" \
+            --color "FBCA04" \
+            --description "Compliance check after a Home Assistant release" \
+            2>/dev/null || true
+
+      - name: Create compliance-check issue
+        if: steps.existing.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HA_VERSION: ${{ steps.ha.outputs.version }}
+          DECLARED_VERSION: ${{ steps.declared.outputs.version }}
+        run: |
+          gh issue create --repo "${{ github.repository }}" \
+            --title "HA ${HA_VERSION}: controleer integratie-compliance" \
+            --assignee RedRecordPlayer \
+            --label ha-release-check \
+            --body "$(cat <<EOF
+          Home Assistant core **${HA_VERSION}** is uitgebracht.
+
+          - Nieuwste HA release: **${HA_VERSION}** (https://github.com/home-assistant/core/releases/tag/${HA_VERSION})
+          - Minimale HA-versie die \`hacs.json\` nu claimt te ondersteunen: **${DECLARED_VERSION}**
+
+          Let op: \`validate.yml\` installeert \`pip install homeassistant\` ongepind, dus de teststaat is altijd tegen de nieuwste HA-versie, niet tegen \`hacs.json\`'s minimum. Dat getal in \`hacs.json\` is dus alleen een claim, geen bewezen ondergrens.
+
+          Controleer of deze integratie nog voldoet aan wat Home Assistant voorschrijft, onder andere:
+
+          - [ ] Breaking changes / deprecations in deze release die deze integratie raken
+          - [ ] \`manifest.json\` nog conform het huidige schema (requirements, quality_scale, iot_class)
+          - [ ] Config flow nog conform de huidige config-flow richtlijnen
+          - [ ] \`hassfest\`-validatie slaagt tegen deze release (zie workflow \`validate.yml\`)
+          - [ ] HACS-validatie slaagt
+          - [ ] Gebruikte HA-API's (coordinator, entity base classes, enz.) niet deprecated of verwijderd
+          - [ ] \`hacs.json\` \`homeassistant\`-minimum bijwerken als ${HA_VERSION} geverifieerd werkt
+
+          Maak voor elk concreet gevonden probleem een apart issue aan en link dat issue hieronder, zodat het los opgepakt en uiteindelijk teruggemerged kan worden naar upstream.
+          EOF
+          )"
